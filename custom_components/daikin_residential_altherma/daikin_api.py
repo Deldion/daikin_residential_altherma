@@ -37,7 +37,7 @@ class DaikinApi:
         _LOGGER.debug("Initialing Daikin Residential API...")
         self.hass = hass
         self._config_entry = entry
-        self.tokenSet = None
+        self.state = None
 
         if entry is not None:
             #print("DAMIANO %s", entry.data[CONF_TOKENSET])
@@ -56,6 +56,57 @@ class DaikinApi:
         self.openIdStore = {}
 
         _LOGGER.info("Daikin Residential API initialized.")
+
+    async def async_requests_with_exception_handling(self, func:functools.partial) -> requests.Response | bool:
+        '''
+        Centralised way to handle all requests.
+        Handles the various exceptions that may be raised and prints the appropriate
+        messages.
+        If there are no errors, returns the response object.
+        If there is an error returns False
+
+        Args:
+            func (functools.partial): Function with requests.get or requests.post
+
+        Returns:
+            dict | bool: Dict with response or False
+        '''
+        resource_url = func.args[0]
+        req_error = False
+        try:
+            response = await self.hass.async_add_executor_job(func)
+        except requests.exceptions.Timeout:
+            req_error = "REQUEST TIMEOUT"
+        except requests.exceptions.ConnectionError:
+            req_error = "CONNECTION ERROR TO: {}".format(resource_url)
+        except requests.exceptions.HTTPError:
+            req_error = "WRONG ADDRESS: {}".format(resource_url)
+        except requests.exceptions.InvalidURL:
+            req_error = "INVALID URL: {}".format(resource_url)
+        except Exception as error:
+            req_error = "REQUEST FAILED: {}".format(error)
+
+        if req_error:
+            _LOGGER.error(req_error)
+            response = False
+        return response
+
+    async def handle_response_content(self, response:requests.Response) -> dict | str:
+        '''
+        Convert JSON format response to dictionairy object
+
+        Args:
+            response (requests.Response): The response..
+
+        Returns:
+            dict | str: Dict or String depending on the conversion result
+        '''
+        try:
+            converted_response = await response.json()
+        except (json.decoder.JSONDecodeError, ValueError, AttributeError) as error:
+            _LOGGER.error("ERROR HANDLING: %s",error)
+            converted_response = response.text
+        return converted_response
 
     async def doBearerRequest(self, resourceUrl, options=None, refreshed=False):
         if self.tokenSet is None:
@@ -82,26 +133,20 @@ class DaikinApi:
         else:
             func = functools.partial(requests.get, resourceUrl, headers=headers)
             # res = requests.get(resourceUrl, headers=headers)
-        try:
-            res = await self.hass.async_add_executor_job(func)
-        except Exception as e:
-            _LOGGER.error("REQUEST FAILED: %s", e)
-        _LOGGER.debug("BEARER RESPONSE CODE: %s", res.status_code)
+        res = await self.async_requests_with_exception_handling(func)
+        if res:
+            _LOGGER.debug("BEARER RESPONSE CODE: %s", res.status_code)
+            if res.status_code == 200:
+                return self.handle_response_content(res)
+            elif res.status_code == 204:
+                return True
 
-        if res.status_code == 200:
-            try:
-                return res.json()
-            except Exception:
-                return res.text
-        elif res.status_code == 204:
-            return True
-
-        if not refreshed and res.status_code == 401:
-            _LOGGER.debug("TOKEN EXPIRED: will refresh it (%s)", res.status_code)
-            await self.refreshAccessToken()
-            return await self.doBearerRequest(resourceUrl, options, True)
-
-        raise Exception("Communication failed! Status: " + str(res.status_code))
+            if not refreshed and res.status_code == 401:
+                _LOGGER.debug("TOKEN EXPIRED: will refresh it (%s)", res.status_code)
+                await self.refreshAccessToken()
+                return await self.doBearerRequest(resourceUrl, options, True)
+            else:
+                raise Exception("Communication failed! Status: " + str(res.status_code))
 
     async def refreshAccessToken(self):
         """Attempt to refresh the Access Token."""
@@ -118,53 +163,52 @@ class DaikinApi:
             "AuthFlow": "REFRESH_TOKEN_AUTH",
             "AuthParameters": {"REFRESH_TOKEN": self.tokenSet["refresh_token"]},
         }
-        try:
-            func = functools.partial(requests.post, url, headers=headers, json=ref_json)
-            res = await self.hass.async_add_executor_job(func)
-            # res = requests.post(url, headers=headers, json=ref_json)
-        except Exception as e:
-            _LOGGER.error("REQUEST FAILED: %s", e)
-        _LOGGER.debug("refreshAccessToken response code: %s", res.status_code)
-        _LOGGER.debug("refreshAccessToken response: %s", res.json())
-        res_json = res.json()
-        data = self._config_entry.data.copy()
+        func = functools.partial(requests.post, url, headers=headers, json=ref_json)
+        res = await self.async_requests_with_exception_handling(func)
+        if res:
+            _LOGGER.debug("refreshAccessToken response code: %s", res.status_code)
+            res_json = await self.handle_response_content(res)
+            if res_json:
+                _LOGGER.debug("refreshAccessToken response: %s", res_json)
+                data = self._config_entry.data.copy()
 
-        if (
-            "AuthenticationResult" in res_json
-            and res_json["AuthenticationResult"]["AccessToken"] is not None
-            and res_json["AuthenticationResult"]["TokenType"] == "Bearer"
-        ):
-            self.tokenSet["access_token"] = res_json["AuthenticationResult"][
-                "AccessToken"
-            ]
-            self.tokenSet["id_token"] = res_json["AuthenticationResult"]["IdToken"]
-            self.tokenSet["expires_at"] = int(
-                datetime.datetime.now().timestamp()
-            ) + int(res_json["AuthenticationResult"]["ExpiresIn"])
-            data[CONF_TOKENSET] = self.tokenSet
-            self.hass.config_entries.async_update_entry(
-                entry=self._config_entry, data=data
-            )
-            _LOGGER.debug("TokenSet refreshed.")
-            # _LOGGER.debug("TOKENSET REFRESHED: %s", self._config_entry.data)
+                if (
+                    "AuthenticationResult" in res_json
+                    and res_json["AuthenticationResult"]["AccessToken"] is not None
+                    and res_json["AuthenticationResult"]["TokenType"] == "Bearer"
+                ):
+                    self.tokenSet["access_token"] = res_json["AuthenticationResult"][
+                        "AccessToken"
+                    ]
+                    self.tokenSet["id_token"] = res_json["AuthenticationResult"]["IdToken"]
+                    self.tokenSet["expires_at"] = int(
+                        datetime.datetime.now().timestamp()
+                    ) + int(res_json["AuthenticationResult"]["ExpiresIn"])
+                    data[CONF_TOKENSET] = self.tokenSet
+                    self.hass.config_entries.async_update_entry(
+                        entry=self._config_entry, data=data
+                    )
+                    _LOGGER.debug("TokenSet refreshed.")
+                    # _LOGGER.debug("TOKENSET REFRESHED: %s", self._config_entry.data)
 
-            return self.tokenSet
-
-        _LOGGER.warning(
-            "CANNOT REFRESH TOKENSET (%s): will login again "
-            + "and retrieve a new tokenSet.",
-            res.status_code,
-        )
-        try:
-            await self.retrieveAccessToken(data[CONF_EMAIL], data[CONF_PASSWORD])
-            data[CONF_TOKENSET] = self.tokenSet
-            self.hass.config_entries.async_update_entry(
-                entry=self._config_entry, data=data
+                    return self.tokenSet
+            _LOGGER.warning(
+                "CANNOT REFRESH TOKENSET (%s): will login again "
+                + "and retrieve a new tokenSet.",
+                res.status_code,
             )
-        except Exception:
-            raise Exception(
-                "Token refresh was not successful! Status: " + str(res.status_code)
-            )
+            try:
+                await self.retrieveAccessToken(data[CONF_EMAIL], data[CONF_PASSWORD])
+                data[CONF_TOKENSET] = self.tokenSet
+                self.hass.config_entries.async_update_entry(
+                    entry=self._config_entry, data=data
+                )
+            except Exception:
+                raise Exception(
+                    "Token refresh was not successful! Status: " + str(res.status_code)
+                )
+        else:
+            raise Exception("Token refresh unsuccessful, response error")
 
     async def _doAuthorizationRequest(self):
         func = functools.partial(self.openIdClient.provider_config, DAIKIN_ISSUER)
@@ -191,9 +235,8 @@ class DaikinApi:
         func = functools.partial(
             self.openIdClient.do_authorization_request, request_args=args, state=state
         )
-        auth_resp = await self.hass.async_add_executor_job(func)
-
         self.state = state
+        auth_resp = await self.async_requests_with_exception_handling(func)        
         return auth_resp
 
     async def _doAccessTokenRequest(self, callbackUrl):
@@ -236,24 +279,27 @@ class DaikinApi:
                 state=state,
                 authn_method=None,
             )
-            rtk_resp = await self.hass.async_add_executor_job(func)
+            rtk_resp = await self.async_requests_with_exception_handling(func)
             # _LOGGER.debug('_RETRIEVETOKENS RESP: %s', rtk_resp)
-            new_tokenset = {
-                "access_token": rtk_resp["access_token"],
-                "refresh_token": rtk_resp["refresh_token"],
-                "expires_in": rtk_resp["expires_in"],
-                "token_type": rtk_resp["token_type"],
-            }
-            _LOGGER.debug("TOKENSET RETRIEVED: %s", new_tokenset)
-            return new_tokenset
+            if rtk_resp:
+                new_tokenset = {
+                    "access_token": rtk_resp["access_token"],
+                    "refresh_token": rtk_resp["refresh_token"],
+                    "expires_in": rtk_resp["expires_in"],
+                    "token_type": rtk_resp["token_type"],
+                }
+                _LOGGER.debug("TOKENSET RETRIEVED: %s", new_tokenset)
+                return new_tokenset
+            else:
+                raise Exception("Cannot Request Access Token. Response error")
         else:
             raise Exception("Daikin-Cloud: ERROR.")
 
     async def retrieveAccessToken(self, userName, password):
         _LOGGER.info("Retrieving new TokenSet...")
         # Extract csrf state cookies
-        try:
-            response = await self._doAuthorizationRequest()
+        response = await self._doAuthorizationRequest()
+        if response:
             cookies = response.headers["set-cookie"]
             # _LOGGER.debug('COOKIES: %s', cookies)
             csrfStateCookie = ""
@@ -267,51 +313,52 @@ class DaikinApi:
             # _LOGGER.debug('CSRFSTATECOOKIE COOKIES: %s', csrfStateCookie)
             location = response.headers["location"]
             # _LOGGER.debug('LOCATION: %s', location)
-        except Exception as e:
+        else:
             raise Exception("Error trying to reach Authorization URL: %s", e)
 
         # Extract SAML Context
-        try:
-            func = functools.partial(requests.get, location, allow_redirects=False)
-            response = await self.hass.async_add_executor_job(func)
-
+        func = functools.partial(requests.get, location, allow_redirects=False)
+        response = await self.async_requests_with_exception_handling(func)
+        if response:
             location = response.headers["location"]
             # _LOGGER.debug('LOCATION2: %s', location)
 
             regex = "samlContext=([^&]+)"
             ms = re.search(regex, location)
             samlContext = ms[1]
-        except Exception as e:
-            raise Exception("Error trying to follow redirect: %s", e)
+        else:
+            raise Exception("Error trying to follow redirect")
         _LOGGER.debug("SAMLCONTEXT: %s", samlContext)
 
         # Extract API version
-        try:
-            func = functools.partial(
-                requests.get, "https://cdns.gigya.com/js/gigya.js", {"apiKey": API_KEY}
-            )
-            resp = await self.hass.async_add_executor_job(func)
+        func = functools.partial(
+            requests.get,
+            "https://cdns.gigya.com/js/gigya.js",
+            {"apiKey": API_KEY}
+        )
+        resp = await self.async_requests_with_exception_handling(func)
+        if resp:
             body = resp.text
             # _LOGGER.debug('BODY: %s', body)
             regex = "(\d+-\d-\d+)"
             ms = re.search(regex, body)
             version = ms[0]
             _LOGGER.debug("VERSION: %s", version)
-        except Exception as e:
-            raise Exception("Error trying to extract API version: %s", e)
+        else:
+            raise Exception("Error trying to extract API version")
 
         # Extract the cookies used for the Single Sign On
-        try:
-            func = functools.partial(
+        func = functools.partial(
                 requests.get,
                 "https://cdc.daikin.eu/accounts.webSdkBootstrap",
                 {"apiKey": API_KEY, "sdk": "js_latest", "format": "json"},
             )
-            resp = await self.hass.async_add_executor_job(func)
+        resp = await self.async_requests_with_exception_handling(func)            
+        if resp:
             ssoCookies = resp.headers["set-cookie"]
             # _LOGGER.debug('SSOCOOKIES: %s', ssoCookies)
-        except Exception as e:
-            raise Exception("Error trying to extract SSO cookies: %s", e)
+        else:
+            raise Exception("Error trying to extract SSO cookies")
 
         ssoCookies_arr = ssoCookies.split(", ")
         cookies = (
@@ -329,39 +376,40 @@ class DaikinApi:
 
         # OK, now let's try to Login
         login_token = ""
-        try:
-            headers = {
-                "content-type": "application/x-www-form-urlencoded",
-                "cookie": cookies,
-            }
-            req_json = {
-                "loginID": userName,
-                "password": password,
-                "sessionExpiration": "31536000",
-                "targetEnv": "jssdk",
-                "include": "profile,",
-                "loginMode": "standard",
-                "riskContext": '{"b0":7527,"b2":4,"b5":1',
-                "APIKey": API_KEY,
-                "sdk": "js_latest",
-                "authMode": "cookie",
-                "pageURL": "https://my.daikin.eu/content/daikinid-cdc-saml/en/"
-                + "login.html?samlContext="
-                + samlContext,
-                "sdkBuild": "12208",
-                "format": "json",
-            }
-            http_args = {}
-            http_args["headers"] = headers
+        
+        headers = {
+            "content-type": "application/x-www-form-urlencoded",
+            "cookie": cookies,
+        }
+        req_json = {
+            "loginID": userName,
+            "password": password,
+            "sessionExpiration": "31536000",
+            "targetEnv": "jssdk",
+            "include": "profile,",
+            "loginMode": "standard",
+            "riskContext": '{"b0":7527,"b2":4,"b5":1',
+            "APIKey": API_KEY,
+            "sdk": "js_latest",
+            "authMode": "cookie",
+            "pageURL": "https://my.daikin.eu/content/daikinid-cdc-saml/en/"
+            + "login.html?samlContext="
+            + samlContext,
+            "sdkBuild": "12208",
+            "format": "json",
+        }
+        http_args = {}
+        http_args["headers"] = headers
 
-            func = functools.partial(
-                requests.post,
-                "https://cdc.daikin.eu/accounts.login",
-                headers=headers,
-                data=req_json,
-            )
-            resp = await self.hass.async_add_executor_job(func)
-            response = resp.json()
+        func = functools.partial(
+            requests.post,
+            "https://cdc.daikin.eu/accounts.login",
+            headers=headers,
+            data=req_json,
+        )
+        resp = await self.async_requests_with_exception_handling(func)
+        if resp:
+            response = await self.handle_response_content(resp)    
             _LOGGER.debug("LOGIN REPLY: %s", response)
 
             if (
@@ -373,8 +421,8 @@ class DaikinApi:
                 login_token = response["sessionInfo"]["login_token"]
             else:
                 raise Exception("Unknown Login error: " + response["errorDetails"])
-        except Exception as e:
-            raise Exception("Login failed: %s", e)
+        else:
+            raise Exception("Login failed")
 
         # _LOGGER.debug('LOGIN TOKEN: %s', login_token)
 
@@ -387,12 +435,13 @@ class DaikinApi:
         cookies += "gig_loginToken_" + API_KEY2 + "_visited=%2C" + API_KEY + ";"
         # _LOGGER.debug('COOKIES: %s', cookies)
 
-        try:
-            headers = {"cookie": cookies}
-            req_json = {"samlContext": samlContext, "loginToken": login_token}
-            url = "https://cdc.daikin.eu/saml/v2.0/" + API_KEY + "/idp/sso/continue"
-            func = functools.partial(requests.post, url, headers=headers, data=req_json)
-            resp = await self.hass.async_add_executor_job(func)
+        
+        headers = {"cookie": cookies}
+        req_json = {"samlContext": samlContext, "loginToken": login_token}
+        url = "https://cdc.daikin.eu/saml/v2.0/" + API_KEY + "/idp/sso/continue"
+        func = functools.partial(requests.post, url, headers=headers, data=req_json)
+        resp = await self.handle_response_content(func)
+        if resp:
             response = resp.text
             # _LOGGER.debug('SAML: %s', response)
             regex = 'name="SAMLResponse" value="([^"]+)"'
@@ -402,29 +451,30 @@ class DaikinApi:
             ms = re.search(regex, response)
             relayState = ms[1]
 
-        except Exception as e:
-            raise Exception("Authentication on SAML Identity Provider failed: %s", e)
+        else:
+            raise Exception("Authentication on SAML Identity Provider failed")
         # _LOGGER.debug('SAMLRESPONSE: %s', samlResponse)
         # _LOGGER.debug('RELAYSTATE: %s', relayState)
 
         # Fetch the daikinunified URL
         daikinunified_url = ""
-        try:
-            headers = {
-                "content-type": "application/x-www-form-urlencoded",
-                "cookie": csrfStateCookie,
-            }
-            req_json = {"SAMLResponse": samlResponse, "RelayState": relayState}
-            body = "SAMLResponse=" + samlResponse + "&RelayState=" + relayState
-            url = DAIKIN_CLOUD_URL + "/saml2/idpresponse"
-            func = functools.partial(
-                requests.post,
-                url,
-                headers=headers,
-                data=req_json,
-                allow_redirects=False,
-            )
-            response = await self.hass.async_add_executor_job(func)
+
+        headers = {
+            "content-type": "application/x-www-form-urlencoded",
+            "cookie": csrfStateCookie,
+        }
+        req_json = {"SAMLResponse": samlResponse, "RelayState": relayState}
+        body = "SAMLResponse=" + samlResponse + "&RelayState=" + relayState
+        url = DAIKIN_CLOUD_URL + "/saml2/idpresponse"
+        func = functools.partial(
+            requests.post,
+            url,
+            headers=headers,
+            data=req_json,
+            allow_redirects=False,
+        )
+        response = await self.async_requests_with_exception_handling(func)
+        if response:
             daikinunified_url = response.headers["location"]
             # _LOGGER.debug('DAIKINUNIFIED1: %s',response)
             # _LOGGER.debug('DAIKINUNIFIED2: %s',daikinunified)
@@ -434,10 +484,8 @@ class DaikinApi:
                     "Invalid final Authentication redirect. Location is "
                     + daikinunified_url
                 )
-        except Exception as e:
-            raise Exception(
-                "Impossible to retrieve SAML Identity Provider's response: %s", e
-            )
+        else:
+            raise Exception("Impossible to retrieve SAML Identity Provider's response")
 
         try:
             self.openIdClient.parse_response(
@@ -451,11 +499,13 @@ class DaikinApi:
         except Exception as e:
             raise Exception("Failed to parse response: %s", e)
 
-        try:
-            self.tokenSet = await self._doAccessTokenRequest(daikinunified_url)
-        except Exception as e:
-            raise Exception("Failed to retrieve access token: %s", e)
-        _LOGGER.info("New TokenSet successfully retrieved.")
+        tokenSet = await self._doAccessTokenRequest(daikinunified_url)
+        if tokenSet:
+            self.tokenSet = tokenSet
+            _LOGGER.info("New TokenSet successfully retrieved.")
+        else:
+            raise Exception("Failed to retrieve access token")
+
 
     async def getApiInfo(self):
         """Get Daikin API Info."""
